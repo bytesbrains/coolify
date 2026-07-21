@@ -1,0 +1,34 @@
+# Dogfood the Verified Security Hunter on a whole branch/release — NO pull request
+# (#213 internal-first). The hunter's core job is finding vulnerabilities in the actual
+# checked-out codebase at a given ref and PROVING them by execution (detonation), which
+# is distinct from PR-diff review (that's the wrokin review/audit product). Pick a ref +
+# level and run; the reusable `wrokin-hunter-run.yml` checks out the ref and hunts the
+# full tree. Findings land as tracked issues server-side (#154).
+name: wrokin security hunter (ref / full-repo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to hunt (full codebase)"
+        required: true
+        default: "dev"
+      level:
+        description: "Scan level — hunt intensity (#121)"
+        required: false
+        default: "stakeout"
+        type: choice
+        options: [foray, stakeout, expedition]
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  hunt:
+    uses: ./.github/workflows/wrokin-hunter-run.yml
+    with:
+      ref: ${{ inputs.ref }}
+      level: ${{ inputs.level }}
+    secrets: inherit
