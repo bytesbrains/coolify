@@ -1,0 +1,99 @@
+# Reusable hunt runner — the SINGLE source of the hunter image digest + run steps
+# (#213). Both dispatch workflows call this via `uses:` so the signed, digest-pinned
+# image is pinned in exactly ONE place (an out-of-sync copy can't silently run a stale
+# image). Callers differ only in what they pass:
+#   - wrokin-hunter.yml    → pr_number  (seed the hunt with a PR diff)
+#   - wrokin-hunt-ref.yml  → ref        (hunt the full checked-out codebase, no PR)
+#
+# Runs the fat image via `docker run` (NOT `uses:`) so it can mount the Docker socket —
+# `detonate` needs it to run the PoC sandbox; a container action doesn't get the socket.
+# Host paths (workspace + RUNNER_TEMP) are mounted at the SAME path inside the container
+# so the nested `docker run --network none` (which talks to the host daemon via the
+# socket) resolves them.
+# NOTE(security, #157): the socket mount grants the container control of the host Docker
+# daemon — by-design for detonation today; the WASM detonation lane (#157) removes the
+# Docker dependency and is the tracked fix.
+#
+# api_base points at the Worker's workers.dev host: the model-proxy traffic carries
+# exploit content that the wrok.in zone's Bot Fight Mode flags (blocks the Pi agent's
+# client fingerprint). TODO(bot-exception, #148): add a Bot Fight Mode exception on
+# api.wrok.in for /hunt/* and switch this back to https://api.wrok.in.
+name: wrokin hunter (run)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number to hunt (PR-diff mode); empty for ref/full-repo mode"
+        required: false
+        type: string
+        default: ""
+      ref:
+        description: "Branch/tag/SHA to hunt (full-repo mode); empty ⇒ default checkout"
+        required: false
+        type: string
+        default: ""
+      level:
+        description: "Scan level — hunt intensity (#121)"
+        required: false
+        type: string
+        default: "stakeout"
+
+# Permissions are intentionally OWNED BY EACH CALLER, not declared here. Every
+# caller MUST grant the always-required set:
+#     contents: read    # checkout
+#     packages: read    # pull the private GHCR image (the docker login step below)
+#     id-token: write   # OIDC check-in to the wrokin brain
+# The PR caller (wrokin-hunter.yml) ALSO grants `pull-requests: read` to read the PR
+# diff; the ref caller (wrokin-hunt-ref.yml) does NOT (full-repo mode reads no PR).
+#
+# Why there's no `permissions:` block here: a reusable workflow's block INTERSECTS
+# with the caller's, so a single static block can't fit both callers — including
+# `pull-requests: read` would startup_fail the ref caller (requests more than it
+# grants); omitting it would strip the PR caller's diff-read scope. Least privilege
+# is therefore enforced per-caller — keep each caller's block minimal.
+env:
+  # 0.5.0 — bundles the digest-pinned `wordpress` detonation fixture (#254): the fat
+  # image now COPYs fixtures.mjs, so a WP plugin hunt can detonate against a real
+  # WordPress instead of degrading to an unverified observation. Signed (cosign keyless)
+  # + SBOM-attested by the `wrokin-hunter image` workflow (run 29856148083). Repin here
+  # whenever a new signed image is published.
+  HUNTER_IMAGE: ghcr.io/bytesbrains/wrokin-hunter@sha256:cba79ef888d8caa203a82f954e28027f048b0d7dfd5f266d04a62b9b494324e6
+  HUNTER_API_BASE: https://pi-backend.sandeep-49e.workers.dev
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "wrokin hunter — level=${{ inputs.level }} pr=${{ inputs.pr_number }} ref=${{ inputs.ref }}"
+      - uses: actions/checkout@v4
+        with:
+          # Empty ref ⇒ checkout's default (the ref that triggered the run) — PR mode.
+          ref: ${{ inputs.ref }}
+
+      - name: Log in to GHCR (pull the private image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Hunt (with the Docker socket for detonation)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_LEVEL: ${{ inputs.level }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$GITHUB_WORKSPACE":"$GITHUB_WORKSPACE" \
+            -v "$RUNNER_TEMP":"$RUNNER_TEMP" \
+            -v "$GITHUB_EVENT_PATH":"$GITHUB_EVENT_PATH":ro \
+            -w "$GITHUB_WORKSPACE" \
+            -e TMPDIR="$RUNNER_TEMP" \
+            -e GITHUB_REPOSITORY -e GITHUB_SHA -e GITHUB_WORKSPACE \
+            -e GITHUB_EVENT_NAME -e GITHUB_EVENT_PATH -e GITHUB_REF_NAME \
+            -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -e GITHUB_TOKEN \
+            -e INPUT_API_BASE="$HUNTER_API_BASE" \
+            -e INPUT_PR_NUMBER \
+            -e INPUT_REF \
+            -e INPUT_LEVEL \
+            "$HUNTER_IMAGE"
